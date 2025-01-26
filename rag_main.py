@@ -1,99 +1,362 @@
-import os
-import sys
-import vosk
+import streamlit as st
 import pandas as pd
+import json
+import matplotlib.pyplot as plt
+from sentence_transformers import SentenceTransformer
+import faiss
+import vosk
 import pyaudio
 import requests
 import gspread
-import json
-from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
-from transformers import RagTokenizer, RagTokenForGeneration
-from transformers import DPRQuestionEncoderTokenizerFast, BartTokenizerFast
-import faiss
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+from sklearn.linear_model import LinearRegression
+import numpy as np
+from dotenv import load_dotenv
+import os
+from transformers import BartForConditionalGeneration, BartTokenizer
 
-# Load environment variables from .env file
+# Load .env file
 load_dotenv()
 
-# File paths from environment variables
-PRODUCT_DATA_FILE = os.getenv("PRODUCT_DATA_FILE")
-OBJECTIONS_DATA_FILE = os.getenv("OBJECTIONS_DATA_FILE")
-VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH")
-GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE")
-HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-API_URL = os.getenv("API_URL", "https://api-inference.huggingface.co/models/distilbert-base-uncased-finetuned-sst-2-english")
-
+# Access variables from the .env file
+api_key = os.getenv('API_KEY')
+model_path=os.getenv('MODEL_PATH')
+prod_path=os.getenv('PROD_PATH')
+obj_path=os.getenv('OBJ_PATH')
 # Load product and objection data
-print("Loading product data...")
-product_data = pd.read_csv(PRODUCT_DATA_FILE)
+@st.cache_resource
+def load_data():
+    product_data = pd.read_csv(prod_path)
+    objections_data = pd.read_csv(obj_path)
+    return product_data, objections_data
+
+product_data, objections_data = load_data()
+
 product_descriptions = product_data['description'].tolist()
 product_titles = product_data['title'].tolist()
-
-print("Loading objections data...")
-objections_data = pd.read_csv(OBJECTIONS_DATA_FILE)
 objections = objections_data['objection'].tolist()
 responses = objections_data['response'].tolist()
 
-# Load Sentence Transformer model
-print("Loading Sentence Transformer model...")
-model = SentenceTransformer('all-MiniLM-L6-v2')
+from transformers import RagTokenizer, RagRetriever, RagSequenceForGeneration
+from sentence_transformers import SentenceTransformer
+from datasets import load_dataset
+import streamlit as st
+import vosk
 
-# Create embeddings for product descriptions and objections
-print("Generating embeddings...")
-product_embeddings = model.encode(product_descriptions)
-objection_embeddings = model.encode(objections)
+from transformers import RagTokenizer, RagRetriever, RagSequenceForGeneration
+from sentence_transformers import SentenceTransformer
+from datasets import load_dataset
+import streamlit as st
+import vosk
 
-# Create FAISS indices for products and objections
-print("Creating FAISS indices...")
-product_index = faiss.IndexFlatL2(product_embeddings.shape[1])
-product_index.add(product_embeddings)
+@st.cache_resource
+def initialize_models():
+    # Load SentenceTransformer model
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    
+    # Initialize RAG tokenizer and model
+    rag_tokenizer = RagTokenizer.from_pretrained("facebook/rag-token-nq")
+    rag_model = RagSequenceForGeneration.from_pretrained("facebook/rag-token-nq")
+    
+    # Initialize RAG retriever
+    rag_retriever = RagRetriever.from_pretrained(
+        "facebook/rag-token-nq",
+        index_name="exact",  # Use 'exact' instead of 'compressed'
+        use_dummy_dataset=True,
+        trust_remote_code=True
+    )
+    
+    # Load Vosk model
+    vosk_model = vosk.Model(model_path)
+    
+    return model, vosk_model, rag_model, rag_tokenizer, rag_retriever
 
-objection_index = faiss.IndexFlatL2(objection_embeddings.shape[1])
-objection_index.add(objection_embeddings)
 
-# Initialize Vosk Model
-print("Loading Vosk model...")
-vosk_model = vosk.Model(VOSK_MODEL_PATH)
-recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
+# Initialize the models
+model, vosk_model, rag_model, rag_tokenizer, rag_retriever = initialize_models()
 
-# Initialize pyaudio
-print("Initializing audio stream...")
-audio = pyaudio.PyAudio()
-stream = audio.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=4000)
 
-# Hugging Face API headers
-headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
+# Initialize the models
+model, vosk_model, rag_model, rag_tokenizer, rag_retriever = initialize_models()
+
+# Create embeddings and FAISS indices
+@st.cache_resource
+def create_indices():
+    product_embeddings = model.encode(product_descriptions)
+    objection_embeddings = model.encode(objections)
+
+    product_index = faiss.IndexFlatL2(product_embeddings.shape[1])
+    product_index.add(product_embeddings)
+
+    objection_index = faiss.IndexFlatL2(objection_embeddings.shape[1])
+    objection_index.add(objection_embeddings)
+
+    return product_index, objection_index
+
+product_index, objection_index = create_indices()
+
+def generate_rag_response(query, retrieved_docs, rag_model, rag_tokenizer):
+    context = " ".join(retrieved_docs)  # Combine retrieved docs
+    input_text = f"Query: {query} Context: {context}"
+    
+    # Tokenize input
+    inputs = rag_tokenizer([input_text], return_tensors="pt", truncation=True, padding=True)
+    
+    # Generate response
+    summary_ids = rag_model.generate(inputs['input_ids'], max_length=200, min_length=50, length_penalty=2.0, num_beams=4, early_stopping=True)
+    response = rag_tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+    
+    return response
+
+
+# Initialize audio stream
+def initialize_audio():
+    audio = pyaudio.PyAudio()
+    stream = audio.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=4000)
+    recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
+    return audio, stream, recognizer
+
+# Hugging Face API for sentiment analysis
+API_URL = "https://api-inference.huggingface.co/models/distilbert-base-uncased-finetuned-sst-2-english"
+API_KEY = api_key
+headers = {"Authorization": f"Bearer {API_KEY}"}
 
 def analyze_sentiment(text):
-    """Analyze sentiment using Hugging Face API."""
     payload = {"inputs": text}
     response = requests.post(API_URL, headers=headers, json=payload)
     if response.status_code == 200:
         result = response.json()
-        if isinstance(result, list) and len(result) > 0:
-            return result[0]
-        elif isinstance(result, dict):
-            return result
+        sentiments = result[0]
+        if len(sentiments) > 0:
+            best_sentiment = max(sentiments, key=lambda x: x['score'])
+            return best_sentiment
         else:
-            print("Unexpected response format:", result)
             return {"label": "ERROR", "score": 0.0}
+    return {"label": "ERROR", "score": 0.0}
+
+# Google Sheets API setup
+
+
+
+def recommend_products(query):
+    query_embedding = model.encode([query])
+    distances, indices = product_index.search(query_embedding, 3)
+    
+    # Check if distances indicate a poor match
+    if distances[0][0] > 1.0:  # Adjust threshold as needed
+        return [("No relevant product found", "We're sorry, but we couldn't find a product matching your query.")]
+    
+    # Return the top matches
+    return [(product_titles[i], product_descriptions[i]) for i in indices[0]]
+
+
+def handle_objection(query):
+    query_embedding = model.encode([query])
+    distances, indices = objection_index.search(query_embedding, 1)
+    
+    # Check if the closest match is not close enough
+    if distances[0][0] > 1.0:  # Adjust threshold based on your dataset
+        return (
+            "Not needed here",
+            
+        )
+    
+    # Return the closest objection and response
+    idx = indices[0][0]
+    return objections[idx], responses[idx]
+
+
+# Function to save session data to a JSON file
+def save_session_data(session_data):
+    with open("session_data.json", "w") as f:
+        json.dump(session_data, f)
+
+# Streamlit UI
+st.title("Real-Time Product Recommendation & Sentiment Analysis")
+
+session_data = {
+    "interactions": [],
+    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+}
+
+
+if st.button("Stop Listening"):
+    st.info("Processing session data...")
+
+    # Load session data from the JSON file
+    with open("session_data.json", "r") as f:
+        session_data = json.load(f)
+    
+    # Import and analyze data using dashboard.py
+    from dashboard import analyze_data  # Ensure dashboard.py is in the same directory
+    analysis_results = analyze_data(session_data)
+    
+    # Initialize variables for the summary
+    summary_data = []
+    all_recommendations = []
+    objection_summary = []
+
+    # Process each interaction in the session data
+    for i, interaction in enumerate(session_data["interactions"]):
+        # Extract relevant data
+        customer_transcription = interaction['transcription']
+        sentiment_label = interaction['sentiment']['label']
+        product_recommendations = [rec[1] for rec in interaction['product_recommendations']]
+        objection = interaction.get('objection_handling', None)
+        
+        # Build the narrative for each interaction
+        if i == 0:
+            # Start of the call
+            summary_data.append(f"When the call started, the customer was {sentiment_label}. ")
+        else:
+            # Progression of the conversation
+            summary_data.append(f"Then, the customer's tone shifted to {sentiment_label}. ")
+        
+        # Add product recommendations to the summary
+        summary_data.append(f"We provided recommendations: {', '.join(product_recommendations)}. ")
+        
+        # Add objection handling if applicable
+        #if objection:
+        #    summary_data.append(f"Objection: {objection['objection']}. Response: {objection['response']}. ")
+        
+        # Collect all recommendations and objections for analysis
+        #all_recommendations.extend(product_recommendations)
+        #if objection:
+        #    objection_summary.append(f"Objection: {objection['objection']}, Response: {objection['response']}")
+
+    # Combine the summary data into one long narrative
+    narrative_summary = " ".join(summary_data)
+    overall_sentiment = (
+        "Overall sentiment trends are depicted in the Call Summary Table and Sentiment Trends graph. "
+        "Explore Sentiment Predictions below to anticipate the customer's future interests."
+    )
+
+    # Debug: Verify narrative summary
+    print("Narrative Summary:", narrative_summary)
+    print("All Recommendations:", all_recommendations)
+    print("Objection Summary:", objection_summary)
+
+    # Load BART model and tokenizer for summarization
+    from transformers import BartForConditionalGeneration, BartTokenizer
+
+    def load_bart_model():
+        model_name = "facebook/bart-large-cnn"  # Pre-trained BART model for summarization
+        model = BartForConditionalGeneration.from_pretrained(model_name)
+        tokenizer = BartTokenizer.from_pretrained(model_name)
+        return model, tokenizer
+
+    model, tokenizer = load_bart_model()
+
+    # Function to generate summary using BART
+    def generate_summary(text, model, tokenizer):
+        inputs = tokenizer.encode("summarize: " + text, return_tensors="pt", max_length=1024, truncation=True)
+        summary_ids = model.generate(inputs, max_length=200, min_length=50, length_penalty=2.0, num_beams=4, early_stopping=True)
+        summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+        return summary
+
+    # Generate the post-call summary
+    call_summary = generate_summary(narrative_summary, model, tokenizer)
+    
+    # Display the post-call summary
+    st.subheader("Post-Call Summary")
+    st.write(f"Session Timestamp: {analysis_results['timestamp']}")
+    st.write("Debug Narrative Summary:", narrative_summary)
+    # Display the summary table
+    
+    st.subheader("Call Summary Table")
+    st.dataframe(analysis_results["summary_table"])
+
+    # Display the sentiment trends chart
+    st.subheader("Sentiment Trends")
+    st.pyplot(analysis_results["sentiment_chart"])
+
+    # Display product recommendation trends
+    st.subheader("Top Product Recommendations")
+    st.pyplot(analysis_results["recommendation_chart"])
+
+    # Display sentiment predictions (if available)
+    st.subheader("Sentiment Predictions")
+    sentiment_predictions = analysis_results["sentiment_predictions"]
+    if isinstance(sentiment_predictions, str):  # Handle insufficient data case
+        st.write(sentiment_predictions)
     else:
-        print(f"Error: {response.status_code}, {response.text}")
-        return {"label": "ERROR", "score": 0.0}
+        st.line_chart(sentiment_predictions)
 
-# Google Sheets API Setup
-print("Setting up Google Sheets API...")
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
-client = gspread.authorize(creds)
-sheet = client.open("sheet").sheet1
+    # Display the word cloud for transcription topics
+    st.subheader("Transcription Word Cloud")
+    st.pyplot(analysis_results["wordcloud"])
 
-def append_to_sheet(sentiment, transcription):
-    """Append the sentiment and transcription to Google Sheets."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sentiment_label = sentiment.get('label', 'Unknown') if isinstance(sentiment, dict) else 'Unknown'
-    sentiment_score = sentiment.get('score', 0.0) if isinstance(sentiment, dict) else 0.0
-    sheet.append_row([timestamp, sentiment_label, sentiment_score, transcription])
+    # Display actionable recommendations
+    st.subheader("Actionable Recommendations")
+    for recommendation in analysis_results["actionable_recommendations"]:
+        st.write(f"- {recommendation}")
 
+
+if st.button("Start Listening"):
+    # Initialize session data and save to JSON at the start
+    session_data = {"interactions": [], "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    with open("session_data.json", "w") as f:
+        json.dump(session_data, f, indent=4)
+
+    st.info("Listening... Speak into the microphone.")
+    audio, stream, recognizer = initialize_audio()
+
+    # Initialize a variable to track the previous sentiment
+    previous_sentiment = None  # Add this line
+
+    try:
+        while True:
+            data = stream.read(4000)
+            if recognizer.AcceptWaveform(data):
+                result = json.loads(recognizer.Result())
+                transcription = result.get("text", "")
+
+                if transcription.strip():
+                    st.write(f"User: {transcription}")
+
+                    # Product Recommendations
+                    recommendations = recommend_products(transcription)
+                    st.subheader("Product Recommendations")
+                    for title, description in recommendations:
+                        st.write(f"- **{title}**: {description}")
+
+                    # Objection Handling
+                    objection, response = handle_objection(transcription)
+                    st.subheader("Objection Handling")
+                    st.write(f"**Objection:** {objection}")
+                    st.write(f"**Response:** {response}")
+
+                    # Sentiment Analysis
+                    sentiment = analyze_sentiment(transcription)
+                    st.subheader("Sentiment Analysis")
+                    st.write(f"**Sentiment:** {sentiment['label']}")
+                    st.write(f"**Score:** {sentiment['score']}")
+
+                    # Track sentiment changes
+                    if previous_sentiment and previous_sentiment != sentiment['label']:
+                        st.warning(f"Sentiment changed from **{previous_sentiment}** to **{sentiment['label']}**.")  # Add this line
+                    previous_sentiment = sentiment['label']  # Update previous sentiment
+
+                    
+
+                    # Add interaction to session data and update JSON file
+                    interaction = {
+                        "transcription": transcription,
+                        "sentiment": sentiment,
+                        "product_recommendations": recommendations,
+                        "objection_handling": {"objection": objection, "response": response},
+                    }
+                    session_data["interactions"].append(interaction)
+
+                    # Update JSON file after every interaction
+                    with open("session_data.json", "w") as f:
+                        json.dump(session_data, f, indent=4)
+
+    except KeyboardInterrupt:
+        st.warning("Stopped listening.")
+    finally:
+        stream.stop_stream()
+        stream.close()
+        audio.terminate()
+        st.success("Final session data saved to session_data.json.")
