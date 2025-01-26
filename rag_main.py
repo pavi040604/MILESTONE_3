@@ -97,4 +97,3 @@ def append_to_sheet(sentiment, transcription):
     sentiment_score = sentiment.get('score', 0.0) if isinstance(sentiment, dict) else 0.0
     sheet.append_row([timestamp, sentiment_label, sentiment_score, transcription])
 
-# Remaining logic unchanged...
